@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+private let log = FileLog.shared
 
 enum AppState: Equatable {
     case loading
@@ -19,10 +20,12 @@ class UsageModel: NSObject, ObservableObject {
     // Triggers view updates every second for live countdowns
     @Published var tick: UInt64 = 0
 
-    private let pollInterval: TimeInterval = 60
+    // API allows ~10 requests/hour. 10 min interval = 6/hour, leaves room for manual refresh.
+    private let normalPollInterval: TimeInterval = 600
+    private let errorPollInterval: TimeInterval = 1800  // 30 min when in error state
     private var isRefreshing = false
     private var started = false
-    private var consecutiveRateLimits = 0
+    private var consecutiveErrors = 0
 
     override init() {
         super.init()
@@ -75,10 +78,7 @@ class UsageModel: NSObject, ObservableObject {
         guard !started else { return }
         started = true
         Task { await refresh() }
-        pollTimer = Timer.scheduledTimer(withTimeInterval: pollInterval, repeats: true) { [weak self] _ in
-            guard let self else { return }
-            Task { @MainActor in await self.refresh() }
-        }
+        schedulePollTimer(interval: normalPollInterval)
         countdownTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             guard let self else { return }
             Task { @MainActor in self.tick &+= 1 }
@@ -92,42 +92,84 @@ class UsageModel: NSObject, ObservableObject {
         countdownTimer = nil
     }
 
+    private func schedulePollTimer(interval: TimeInterval) {
+        pollTimer?.invalidate()
+        log.info("Poll timer set to \(Int(interval))s")
+        pollTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            Task { @MainActor in await self.refresh() }
+        }
+    }
+
+    private func onSuccess() {
+        let wasInErrorState = consecutiveErrors > 0
+        consecutiveErrors = 0
+        if wasInErrorState {
+            schedulePollTimer(interval: normalPollInterval)
+        }
+    }
+
+    private func onError() {
+        consecutiveErrors += 1
+        // Slow down polling when errors accumulate
+        if consecutiveErrors >= 3 {
+            schedulePollTimer(interval: errorPollInterval)
+            log.warning("Slowed polling to \(Int(errorPollInterval))s after \(consecutiveErrors) consecutive errors")
+        }
+    }
+
     func refresh() async {
-        guard !isRefreshing else { return }
+        guard !isRefreshing else {
+            log.debug("refresh() skipped — already refreshing")
+            return
+        }
         isRefreshing = true
         defer { isRefreshing = false }
 
+        // Layer 1: Keychain read
         guard let credentials = KeychainManager.readCredentials() else {
+            log.error("Layer 1 FAIL: Keychain read returned nil")
             state = .unauthenticated
+            onError()
             return
         }
+        let tokenExpired = credentials.expiresAt < Date()
+        log.debug("Layer 1 OK: token=...\(String(credentials.accessToken.suffix(6))) expired=\(tokenExpired)")
 
         var accessToken = credentials.accessToken
 
-        // If token is expired, try to refresh first
-        if credentials.expiresAt < Date() {
+        // Layer 2: Token refresh (if expired)
+        if tokenExpired {
+            log.info("Layer 2: Token expired, attempting refresh")
             do {
                 let tokenResponse = try await UsageService.refreshAccessToken(
                     refreshToken: credentials.refreshToken)
                 let newExpiry = Date().addingTimeInterval(Double(tokenResponse.expiresIn))
                 _ = KeychainManager.updateAccessToken(tokenResponse.accessToken, expiresAt: newExpiry)
                 accessToken = tokenResponse.accessToken
-            } catch UsageServiceError.unauthenticated {
-                state = .unauthenticated
-                return
+                log.info("Layer 2 OK: Token refreshed")
             } catch {
-                // Refresh failed, try with existing token anyway
+                log.error("Layer 2 FAIL: Refresh error: \(error)")
+                // Don't try the API with an expired token — it'll just waste requests
+                state = .unauthenticated
+                onError()
+                return
             }
         }
 
+        // Layer 3: Usage API call
+        log.info("Layer 3: Calling usage API")
         do {
             let data = try await UsageService.fetchUsage(accessToken: accessToken)
             usage = data
             lastUpdated = Date()
             state = .loaded
-            consecutiveRateLimits = 0
+            onSuccess()
+            log.info("Layer 3 OK: 5h=\(Int(data.fiveHour.utilization))% 7d=\(Int(data.sevenDay.utilization))%")
         } catch UsageServiceError.unauthenticated {
-            // Try token refresh if we haven't already
+            log.error("Layer 3 FAIL: 401/403 — token rejected")
+            // Token was valid per expiry but server rejected it.
+            // Try ONE refresh, then give up until next poll.
             do {
                 let tokenResponse = try await UsageService.refreshAccessToken(
                     refreshToken: credentials.refreshToken)
@@ -138,34 +180,30 @@ class UsageModel: NSObject, ObservableObject {
                 usage = data
                 lastUpdated = Date()
                 state = .loaded
-            } catch UsageServiceError.unauthenticated {
-                state = .unauthenticated
+                onSuccess()
+                log.info("Layer 3 OK (after refresh): 5h=\(Int(data.fiveHour.utilization))%")
             } catch {
+                log.error("Layer 3 FAIL: Still failing after refresh: \(error)")
                 state = .unauthenticated
+                onError()
             }
-        } catch UsageServiceError.rateLimited {
-            consecutiveRateLimits += 1
-            let backoff = min(60.0 * pow(2.0, Double(consecutiveRateLimits - 1)), 600.0)
-            if usage != nil {
-                // Have data, silently schedule a delayed retry
-            } else {
-                let mins = Int(backoff) / 60
-                let secs = Int(backoff) % 60
-                let waitText = mins > 0 ? "\(mins)m \(secs)s" : "\(secs)s"
-                state = .error("Rate limited — retrying in \(waitText)")
+        } catch UsageServiceError.rateLimited(let retryAfter) {
+            let waitSeconds = max(retryAfter, Int(errorPollInterval))
+            log.warning("Layer 3 FAIL: Rate limited, retry-after=\(retryAfter)s, will wait \(waitSeconds)s")
+            if usage == nil {
+                let mins = waitSeconds / 60
+                state = .error("Rate limited — retrying in \(mins)m")
             }
-            // Schedule a one-off retry after backoff
-            let delay = backoff
-            Task {
-                try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
-                await refresh()
-            }
+            // Respect the server's retry-after. Don't use onError() here because
+            // we set a specific timer based on the retry-after header value.
+            schedulePollTimer(interval: TimeInterval(waitSeconds))
+            consecutiveErrors += 1
         } catch {
-            if usage != nil {
-                // Keep showing stale data on transient errors
-            } else {
+            log.error("Layer 3 FAIL: \(error)")
+            if usage == nil {
                 state = .error(error.localizedDescription)
             }
+            onError()
         }
     }
 
