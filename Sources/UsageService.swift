@@ -3,7 +3,7 @@ private let log = FileLog.shared
 
 struct UsageWindow: Codable {
     let utilization: Double
-    let resetsAt: String
+    let resetsAt: String?
 
     enum CodingKeys: String, CodingKey {
         case utilization
@@ -11,6 +11,7 @@ struct UsageWindow: Codable {
     }
 
     var resetsAtDate: Date? {
+        guard let resetsAt else { return nil }
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         if let date = formatter.date(from: resetsAt) { return date }
